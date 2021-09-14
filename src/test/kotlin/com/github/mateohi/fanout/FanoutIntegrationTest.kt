@@ -3,6 +3,7 @@ package com.github.mateohi.fanout
 import com.github.mateohi.fanout.dto.Event
 import com.amazonaws.services.sqs.AmazonSQS
 import com.amazonaws.services.sqs.AmazonSQSClientBuilder
+import com.amazonaws.services.sqs.model.CreateQueueRequest
 import com.fasterxml.jackson.databind.SerializationFeature
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
@@ -12,6 +13,7 @@ import org.apache.kafka.clients.consumer.Consumer
 import org.apache.kafka.clients.consumer.ConsumerConfig
 import org.apache.kafka.common.serialization.StringDeserializer
 import org.assertj.core.api.Assertions.assertThat
+import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.Test
 import org.springframework.boot.test.context.SpringBootTest
@@ -88,8 +90,20 @@ class FanoutIntegrationTest {
                     .build()
         }
 
+        lateinit var eventsDlQueueUrl: String
+
         val eventsQueueUrl: String by lazy {
-            sqs.createQueue("events").queueUrl
+            val deadLetterQueueName = "events-dl"
+            eventsDlQueueUrl = sqs.createQueue(deadLetterQueueName).queueUrl
+
+            val deadLetterArn = "arn:aws:sqs:${localStack.region}:000000000000:$deadLetterQueueName"
+            val createQueueRequest = CreateQueueRequest()
+                    .withQueueName("events")
+                    .withAttributes(mapOf(
+                            "VisibilityTimeout" to "1",
+                            "RedrivePolicy" to """{ "deadLetterTargetArn": "$deadLetterArn", "maxReceiveCount": "1" }"""
+                    ))
+            sqs.createQueue(createQueueRequest).queueUrl
         }
 
         @JvmStatic
@@ -108,6 +122,11 @@ class FanoutIntegrationTest {
         }
     }
 
+    @AfterEach
+    fun cleanupSqs() = sqs.receiveMessage(eventsQueueUrl).messages.forEach {
+        sqs.deleteMessage(eventsQueueUrl, it.receiptHandle)
+    }
+
     @Test
     fun `test published SQS messages get consumed and published in Kafka`() {
         // given
@@ -115,36 +134,33 @@ class FanoutIntegrationTest {
 
         // when
         publishMessage(event)
-        SECONDS.sleep(2)
+        SECONDS.sleep(1)
 
         // then
         val messageCount = sqs.receiveMessage(eventsQueueUrl).messages.stream().count()
-        val eventCount = kafkaConsumer.poll(Duration.ofSeconds(2)).count()
+        val eventCount = kafkaConsumer.poll(Duration.ofSeconds(1)).count()
 
         assertThat(messageCount).isEqualTo(0)
         assertThat(eventCount).isEqualTo(1)
     }
 
     @Test
-    fun `test incorrect published SQS messages do not get consumed or published in Kafka`() {
+    fun `test incorrect published SQS messages do not get published in Kafka and redriven`() {
         // given
         val event = event(eventType = "wrong.something", payload = "payload for wrong message")
 
         // when
         publishMessage(event)
-        SECONDS.sleep(2)
+        SECONDS.sleep(1)
 
         // then
         val messageCount = sqs.receiveMessage(eventsQueueUrl).messages.stream().count()
-        val eventCount = kafkaConsumer.poll(Duration.ofSeconds(2)).count()
+        val messageCountDl = sqs.receiveMessage(eventsDlQueueUrl).messages.stream().count()
+        val eventCount = kafkaConsumer.poll(Duration.ofSeconds(1)).count()
 
-        assertThat(messageCount).isEqualTo(1)
+        assertThat(messageCount).isEqualTo(0)
+        assertThat(messageCountDl).isEqualTo(1)
         assertThat(eventCount).isEqualTo(0)
-
-        // cleanup
-        sqs.receiveMessage(eventsQueueUrl).messages.first().receiptHandle.let {
-            sqs.deleteMessage(eventsQueueUrl, it)
-        }
     }
 
     private fun publishMessage(event: Event) =
